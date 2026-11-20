@@ -44,6 +44,12 @@ abstract contract PreparedFixture {
         return (IWithdrawalQueue(address(model)), 1);
     }
 
+    function _deployHook() internal virtual returns (TunasHook) {
+        TunasHook implementation = new TunasHook(pm, factory, CURATOR, CAPITAL);
+        vm.etch(address(0x32A88), address(implementation).code);
+        return TunasHook(address(0x32A88));
+    }
+
     function setUp() public {
         forkEthereum(vm);
         vm.deal(address(this), 1000 ether);
@@ -51,9 +57,7 @@ abstract contract PreparedFixture {
         vm.deal(CURATOR, 10 ether);
         (queue, requestId) = _source();
         factory = new TunasFactory(queue, weth);
-        TunasHook implementation = new TunasHook(pm, factory, CURATOR, CAPITAL);
-        vm.etch(address(0x32A88), address(implementation).code);
-        market = TunasHook(address(0x32A88));
+        market = _deployHook();
         weth.deposit{value: 100 ether}();
         weth.transfer(CAPITAL, 100 ether);
         vm.prank(CAPITAL);
@@ -373,6 +377,27 @@ contract TunasPreparedModelTest is PreparedFixture {
 }
 
 contract TunasPreparedCanonicalTest is PreparedFixture {
+    address private constant CREATE2_PROXY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+
+    function _deployHook() internal override returns (TunasHook) {
+        bytes memory initCode =
+            abi.encodePacked(type(TunasHook).creationCode, abi.encode(pm, factory, CURATOR, CAPITAL));
+        bytes32 initCodeHash = keccak256(initCode);
+        for (uint256 nonce; nonce < 1 << 20; ++nonce) {
+            bytes32 salt = bytes32(nonce);
+            bytes32 hash = keccak256(abi.encodePacked(hex"ff", CREATE2_PROXY, salt, initCodeHash));
+            address predicted = address(uint160(uint256(hash)));
+            if (uint160(predicted) & 0x3fff != 0x2a88) continue;
+
+            (bool ok, bytes memory output) = CREATE2_PROXY.call(abi.encodePacked(salt, initCode));
+            require(
+                ok && address(bytes20(output)) == predicted && predicted.code.length > 0, "CREATE2 failed"
+            );
+            return TunasHook(predicted);
+        }
+        revert("No hook salt found");
+    }
+
     function _source() internal override returns (IWithdrawalQueue, uint256) {
         IStETH(STETH).submit{value: 101 ether}(address(0));
         IERC20(STETH).approve(address(LIDO), type(uint256).max);
