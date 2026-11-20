@@ -1,4 +1,5 @@
 import argparse
+import fcntl
 import json
 import re
 import subprocess
@@ -6,10 +7,19 @@ import sys
 import time
 from pathlib import Path
 
+from deployment_manifest import publish
 from local_fork import EXTERNAL, ForkError, LocalRPC, verify_fork
 
 CONTRACTS_DIR = Path(__file__).resolve().parents[1]
-CONTRACT_NAMES = {"factory": "TunasFactory", "implementation": "TunasReceipt", "hook": "TunasHook"}
+DEPLOYMENTS_DIR = CONTRACTS_DIR.parent / "deployments"
+ARTIFACTS = {
+    "factory": ("TunasFactory.sol", "TunasFactory"),
+    "implementation": ("TunasReceipt.sol", "TunasReceipt"),
+    "hook": ("TunasHook.sol", "TunasHook"),
+    "queue": ("ITunasAssets.sol", "IWithdrawalQueue"),
+    "weth": ("ITunasAssets.sol", "IWETH"),
+    "poolManager": ("IV4PoolManager.sol", "IV4PoolManager"),
+}
 HOOK_MASK = 0x3FFF
 HOOK_FLAGS = 0x2A88
 
@@ -20,8 +30,8 @@ def build_contracts(solc):
         command += ["--use", solc]
     subprocess.run(command, check=True)
     return {
-        key: json.loads((CONTRACTS_DIR / "out" / f"{name}.sol" / f"{name}.json").read_text())
-        for key, name in CONTRACT_NAMES.items()
+        key: json.loads((CONTRACTS_DIR / "out" / filename / f"{name}.json").read_text())
+        for key, (filename, name) in ARTIFACTS.items()
     }
 
 
@@ -138,7 +148,7 @@ def deploy(rpc, solc):
         "curator()": curator, "capitalOwner()": capital,
     })
 
-    return {
+    deployment = {
         "contracts": {**external, "factory": factory, "implementation": implementation, "hook": hook},
         "codeHashes": {
             **{name: digest for name, (_, digest) in EXTERNAL.items()},
@@ -147,8 +157,12 @@ def deploy(rpc, solc):
         "roles": {"seller": seller, "curator": curator, "capitalOwner": capital},
         "factoryReceipt": factory_tx,
         "hookReceipt": hook_tx,
-        "create2": {"deployer": proxy, "salt": salt, "initCodeHash": init_code_hash, "flags": hex(HOOK_FLAGS)},
+        "create2": {
+            "deployer": proxy, "salt": salt, "initCodeHash": init_code_hash,
+            "flags": hex(HOOK_FLAGS), "mask": hex(HOOK_MASK),
+        },
     }
+    return deployment, artifacts
 
 
 def main():
@@ -157,10 +171,19 @@ def main():
     parser.add_argument("--solc", help="Path to the pinned Solidity compiler")
     args = parser.parse_args()
     try:
-        deployment = deploy(LocalRPC(args.port), args.solc)
+        rpc = LocalRPC(args.port)
+        source_commit = subprocess.check_output(
+            ["git", "log", "-1", "--format=%H", "--", "contracts/src"],
+            cwd=CONTRACTS_DIR.parent, text=True,
+        ).strip()
+        with (DEPLOYMENTS_DIR / ".local.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            deployment, artifacts = deploy(rpc, args.solc)
+            path = publish(DEPLOYMENTS_DIR, rpc.url, deployment, artifacts, source_commit)
     except (ForkError, OSError, subprocess.SubprocessError, ValueError) as error:
         sys.exit(str(error))
-    print(json.dumps(deployment, indent=2))
+    print(f"Hook {deployment['contracts']['hook']}")
+    print(f"Manifest {path}")
 
 
 if __name__ == "__main__":
